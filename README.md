@@ -1,36 +1,48 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# alexyoung.dev
 
-## Getting Started
+Personal website with a CLI terminal theme. Visitors can type commands like `help`, `about`, `projects`, and `blog` to explore content — or scroll through traditional sections below.
 
-First, run the development server:
+## Tech Stack
+
+- **Next.js 16** with static export
+- **TypeScript**
+- **Tailwind CSS v4**
+- **Framer Motion** for animations
+- **MDX** for blog posts
+
+## Development
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Blog
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Add new posts as `.mdx` files in `content/blog/`:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```
+---
+title: "Post Title"
+date: "2026-03-28"
+excerpt: "Short description."
+tags: ["tag1", "tag2"]
+---
 
-## Learn More
+Your content here...
+```
 
-To learn more about Next.js, take a look at the following resources:
+## Build & Deploy
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```bash
+npm run build   # outputs to ./out/
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Deployed automatically to GitHub Pages via `.github/workflows/deploy.yml` on push to `main`.
 
-## Deploy on Vercel
+## Customization
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- **Projects**: Edit `src/lib/constants.ts` to update featured projects
+- **Experience**: Edit `src/lib/constants.ts` to update work history
+- **Social links**: Edit `src/lib/constants.ts` to update links
+- **Terminal commands**: Edit `src/lib/commands.ts` to add new commands
