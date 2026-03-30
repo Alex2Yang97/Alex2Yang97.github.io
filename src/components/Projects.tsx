@@ -32,12 +32,12 @@ export default function Projects() {
     <section id="projects" className="py-20 md:py-28 px-4 md:px-8 bg-surface/50">
       <div className="max-w-4xl mx-auto">
         <ScrollReveal>
-          <h2 className="text-terminal-green text-sm mb-2 tracking-wider">
+          <p className="text-terminal-green text-sm mb-2 tracking-wider">
             $ ls projects/
-          </h2>
-          <h3 className="text-2xl md:text-3xl font-bold mb-8 text-foreground">
+          </p>
+          <h2 className="text-2xl md:text-3xl font-bold mb-8 text-foreground">
             Open Source Projects
-          </h3>
+          </h2>
         </ScrollReveal>
 
         <div className="grid gap-4 md:grid-cols-2">
@@ -47,12 +47,12 @@ export default function Projects() {
                 href={project.url}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="block bg-surface border border-border rounded-lg p-5 hover:border-terminal-green/50 transition-all duration-300 group h-full"
+                className="block bg-surface border border-border rounded-lg p-5 hover:border-terminal-green/50 transition-all duration-300 group h-full focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-terminal-green"
               >
                 <div className="flex items-start justify-between mb-3">
-                  <h4 className="font-semibold text-foreground group-hover:text-terminal-green transition-colors">
+                  <h3 className="font-semibold text-foreground group-hover:text-terminal-green transition-colors">
                     {project.name}
-                  </h4>
+                  </h3>
                   <svg
                     className="w-4 h-4 text-terminal-muted group-hover:text-terminal-green transition-colors shrink-0 mt-1"
                     fill="none"

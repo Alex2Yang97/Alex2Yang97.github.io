@@ -12,6 +12,7 @@ export interface CommandResult {
   output: string;
   isHTML?: boolean;
   clear?: boolean;
+  action?: "toggle-theme" | "set-theme-light" | "set-theme-dark" | "switch-gui";
 }
 
 const HELP_TEXT = `
@@ -24,7 +25,10 @@ Available commands:
   blog <slug>  Read a specific post
   contact      How to reach me
   clear        Clear terminal
-  theme        Cycle color theme
+  theme        Toggle light/dark theme
+  theme light  Switch to light theme
+  theme dark   Switch to dark theme
+  gui          Switch to GUI mode
   help         Show this message
 `;
 
@@ -140,8 +144,17 @@ export function executeCommand(
       return { output: formatContact() };
     case "clear":
       return { output: "", clear: true };
-    case "theme":
-      return { output: "\n  Theme toggled.\n" };
+    case "theme": {
+      if (args[0] === "light") {
+        return { output: "\n  Theme set to light.\n", action: "set-theme-light" };
+      }
+      if (args[0] === "dark") {
+        return { output: "\n  Theme set to dark.\n", action: "set-theme-dark" };
+      }
+      return { output: "\n  Theme toggled.\n", action: "toggle-theme" };
+    }
+    case "gui":
+      return { output: "\n  Switching to GUI mode...\n", action: "switch-gui" };
     case "":
       return { output: "" };
     default:
