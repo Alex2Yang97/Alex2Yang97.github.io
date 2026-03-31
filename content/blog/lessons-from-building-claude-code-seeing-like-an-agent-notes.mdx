@@ -1,0 +1,121 @@
+---
+title: "Reading Notes: Lessons from Building Claude Code, Seeing Like an Agent"
+date: "2026-03-30"
+excerpt: "My key takeaways on designing agent tools: shape tools to model abilities, revisit assumptions, and use progressive disclosure."
+tags: ["reading-notes", "ai-agents", "tooling", "claude-code", "agent-design"]
+---
+
+These are my notes from the article [**"Lessons from Building Claude Code: Seeing like an Agent."**](https://x.com/trq212/status/2027463795355095314)  
+The core idea is simple: design tools around what the model can actually do today, then keep updating those tools as model capabilities change.
+
+## Main thesis
+
+Give agents tools shaped to their abilities.
+
+The hard part is figuring out those abilities in practice. The article's answer is:
+
+- pay attention to model behavior
+- read outputs closely
+- run experiments
+- revise tool design based on what you observe
+
+In short: learn to **see like an agent**.
+
+## Use case 1: Improving elicitation with `AskUserQuestion`
+
+The team wanted Claude to ask better questions with less friction for users.
+
+They tried three approaches:
+
+1. **Add questions to an existing planning tool**  
+   This was easy to ship but confusing for the model. It mixed plan output and question output in one call.
+
+2. **Prompt for a strict markdown question format**  
+   This was flexible, but not reliable. The model sometimes added extra text, skipped options, or changed format.
+
+3. **Create a dedicated `AskUserQuestion` tool**  
+   This worked best. The tool enforced structure, showed a modal, and paused the loop until the user answered.
+
+Important lesson: even a well-designed tool fails if the model does not understand when and how to call it.
+
+## Use case 2: `TodoWrite` to `Task`
+
+At first, Claude used `TodoWrite` to stay on track.
+
+- The model still forgot goals, so the team added system reminders every 5 turns.
+- Later, as models improved, those reminders became counterproductive and made behavior too rigid.
+
+The framing then shifted:
+
+- **Todos**: keep one model on track
+- **Tasks**: help multiple agents and subagents communicate
+
+`Task` supported updates, dependencies, shared progress, and deletion. This fit stronger models better.
+
+One practical guideline from this section: support a **small set of models with similar capability profiles**, because tool assumptions do not transfer perfectly across very different models.
+
+## Use case 3: Search design, RAG to Grep
+
+Early Claude Code used RAG retrieval for context.
+
+That helped with speed, but came with costs:
+
+- indexing and setup overhead
+- fragility across environments
+- and a key limitation: the model was often *given* context instead of *building* context itself
+
+Moving toward search tools (like Grep) let the model build context actively.
+
+Over time, this evolved further with **Agent Skills** and **progressive disclosure**:
+
+- a skill file can point to other files
+- the model can recursively follow references
+- context is gathered layer by layer based on the current need
+
+The timeline matters: Claude moved from weak self-context-building to nested multi-layer context search across a year.
+
+## Use case 4: Progressive disclosure with a guide subagent
+
+The team noticed Claude often struggled with "how Claude Code itself works" questions.
+
+They had options:
+
+- Put all docs in system prompt (too much context, hurts core coding tasks)
+- Give Claude a docs link (better, but Claude often loaded too many results)
+
+They then built a **Claude Code Guide subagent** with focused instructions on:
+
+- what to search
+- how to search
+- what answer shape to return
+
+This added capability without introducing another broad top-level tool.
+
+## Cross-cutting lessons
+
+- Claude Code has about **~20 tools** already.
+- The bar for adding a new tool should be high because each tool is another decision branch for the model.
+- Progressive disclosure is a strong way to add functionality without expanding the tool surface too much.
+- As model capabilities improve, tools that once helped can start to constrain behavior.
+
+The key operating rule: **revisit your assumptions continuously**.
+
+## What stood out to me
+
+I like how practical this article is. It does not claim there is one correct framework.  
+It shows that tool design is iterative and model-dependent.
+
+The biggest takeaway for me is this shift:
+
+- do not only ask "what features should I add?"
+- also ask "what cognitive burden am I adding for the model?"
+
+That mindset makes tool design feel less like API design and more like interface design for an evolving collaborator.
+
+## Wrap-up
+
+Designing agent tooling is not a one-time architecture decision. It is continuous product work.
+
+Observe behavior, run experiments, keep what works, remove what no longer fits, and keep the action space clean.
+
+**Source:** [Lessons from Building Claude Code: Seeing like an Agent](https://x.com/trq212/status/2027463795355095314) (shared on X).

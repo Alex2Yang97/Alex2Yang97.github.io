@@ -65,7 +65,7 @@ export default async function BlogPost({
           </div>
         </header>
 
-        <div className="prose prose-invert prose-green max-w-none prose-headings:text-foreground prose-p:text-terminal-muted prose-a:text-terminal-green prose-strong:text-foreground prose-code:text-terminal-orange prose-pre:bg-surface prose-pre:border prose-pre:border-border">
+        <div className="prose prose-invert prose-green max-w-none prose-headings:text-foreground prose-p:text-terminal-muted prose-li:text-terminal-muted prose-a:text-terminal-green prose-a:underline prose-strong:text-foreground prose-code:text-terminal-orange prose-pre:bg-surface prose-pre:border prose-pre:border-border prose-blockquote:border-terminal-green/40 prose-blockquote:text-terminal-muted prose-hr:border-border">
           <MDXRemote
             source={post.content}
             options={{
