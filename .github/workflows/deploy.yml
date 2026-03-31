@@ -3,6 +3,19 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [main]
+    # Redeploy only when site-related files change. Edits under .cursor/skills alone
+    # do not affect the static export and should not trigger Pages builds.
+    paths:
+      - "src/**"
+      - "content/**"
+      - "public/**"
+      - "package.json"
+      - "package-lock.json"
+      - "next.config.ts"
+      - "tsconfig.json"
+      - "postcss.config.mjs"
+      - "eslint.config.mjs"
+      - ".github/workflows/**"
   workflow_dispatch:
 
 permissions:
