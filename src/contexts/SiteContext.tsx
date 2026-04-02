@@ -51,7 +51,7 @@ export function SiteProvider({ children }: { children: ReactNode }) {
 
   const setMode = useCallback((m: ViewMode) => {
     setModeState(m);
-    localStorage.setItem("viewMode", m);
+    sessionStorage.setItem("viewMode", m);
   }, []);
 
   useEffect(() => {
@@ -65,7 +65,7 @@ export function SiteProvider({ children }: { children: ReactNode }) {
     setThemeState(initialTheme);
     applyTheme(initialTheme);
 
-    const storedMode = localStorage.getItem("viewMode");
+    const storedMode = sessionStorage.getItem("viewMode");
     if (storedMode === "cli" || storedMode === "gui") {
       setModeState(storedMode);
     }

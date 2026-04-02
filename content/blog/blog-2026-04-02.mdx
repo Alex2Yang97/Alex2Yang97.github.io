@@ -1,0 +1,62 @@
+---
+title: "Reading Notes: Advanced Tool Use, Code Execution with MCP"
+date: "2026-04-02"
+excerpt: "My key takeaways on advanced tool use and code execution with MCP."
+tags: ["reading-notes", "ai-agents", "tool-use", "mcp", "claude-code", "agent-design"]
+---
+
+[**Advanced Tool Use**](https://www.anthropic.com/engineering/advanced-tool-use)
+
+This article talks about three features that help build agents with a large number of tools, with better context management and accuracy.
+
+## 1. Tool Search Tool
+
+Instead of loading all tools at once upfront, the agent can defer tool loading and use a tool search tool to discover and load only the relevant tools needed for the current task. This improves both context efficiency and tool selection accuracy (less confusion between similarly named tools).
+
+## 2. Programmatic Tool Calling
+
+The agent writes code to orchestrate tool calls in a sandbox, rather than calling tools one-by-one through the model. Benefits:
+
+- Intermediate results stay in the execution environment instead of polluting the context window
+- Code handles control flow (loops, conditionals, error handling) directly, eliminating extra inference passes
+- Enables parallel tool execution, reducing latency
+- Only the final output is returned to the model
+
+## 3. Tool Use Examples
+
+Provide concrete usage examples alongside the tool schema, not just the schema alone. Most beneficial when:
+
+- Complex nested structures where valid JSON doesn't imply correct usage
+- Tools with many optional parameters where inclusion patterns matter
+- APIs with domain-specific conventions not captured in schemas
+- Similar tools where examples clarify which one to use (e.g., `create_ticket` vs `create_incident`)
+
+---
+
+[**Code Execution with MCP**](https://www.anthropic.com/engineering/code-execution-with-mcp)
+
+This article is essentially the same core idea as PTC (Programmatic Tool Calling), but it explains the motivation and benefits of providing code execution capability to agents (in the context of MCP)
+
+## The problem: excessive token consumption from tools
+
+1. Tool definitions overload the context window
+2. Intermediate tool results consume additional tokens — and every intermediate result must pass through the model, which can cause mistakes when dealing with large documents or complex data structures
+
+## The solution: present MCP servers as code APIs
+
+Instead of direct tool calls, the agent writes code to interact with MCP servers. This addresses both problems: tools are only loaded when needed (progressive disclosure), and data is processed in a sandbox before passing results back to the model. One concrete approach is exposing a file tree of all available MCP tools, which the agent navigates on demand.
+
+## Benefits
+
+1. **Progressive disclosure** — agent reads tool definitions on demand rather than all upfront
+2. **Context-efficient tool results** — large intermediate data stays in the execution environment; control flow logic (loops, conditionals) runs in code rather than through the model, saving tokens and latency
+3. **Privacy-preserving operations** — sensitive data flows through the execution environment without ever entering the model context
+4. **State persistence and skills** — agent can save intermediate results and reusable code (same idea as Skills)
+
+## Trade-off to keep in mind
+
+Code execution requires a secure sandbox, resource limits, and monitoring — operational overhead that direct tool calls avoid. The benefits should be weighed against this complexity.
+
+**Source:** [Advanced Tool Use](https://www.anthropic.com/engineering/advanced-tool-use).
+
+**Source:** [Code Execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp).
