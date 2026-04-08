@@ -38,7 +38,10 @@ export default function About() {
 
         <div className="space-y-6">
           {EXPERIENCE.map((exp, i) => (
-            <ScrollReveal key={exp.period} delay={0.1 * (i + 1)}>
+            <ScrollReveal
+              key={`${exp.period}-${exp.company}-${exp.role}`}
+              delay={0.1 * (i + 1)}
+            >
               <div className="relative pl-6 border-l-2 border-border hover:border-terminal-green transition-colors">
                 <div className="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-terminal-green" />
                 <p className="text-sm text-terminal-orange mb-1">
@@ -50,9 +53,17 @@ export default function About() {
                 <p className="text-sm text-terminal-muted mb-2">
                   {exp.company}
                 </p>
-                <p className="text-sm text-terminal-muted leading-relaxed">
-                  {exp.description}
-                </p>
+                {exp.bullets && exp.bullets.length > 0 ? (
+                  <ul className="text-sm text-terminal-muted leading-relaxed list-disc pl-4 space-y-1.5">
+                    {exp.bullets.map((item, j) => (
+                      <li key={j}>{item}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-sm text-terminal-muted leading-relaxed">
+                    {exp.description}
+                  </p>
+                )}
               </div>
             </ScrollReveal>
           ))}

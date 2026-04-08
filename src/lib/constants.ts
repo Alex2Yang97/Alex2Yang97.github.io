@@ -72,30 +72,53 @@ export interface Experience {
   role: string;
   company: string;
   period: string;
-  description: string;
+  /** Short paragraph (optional); prefer bullets for structured roles */
+  description?: string;
+  bullets?: string[];
 }
 
 export const EXPERIENCE: Experience[] = [
   {
-    role: "AI Engineer",
-    company: "Your Company",
-    period: "2024 - Present",
-    description:
-      "Building AI-powered applications and MCP servers. Working on LLM integrations, deep research systems, and financial data tools.",
+    role: "Assistant Director, AI Engineer",
+    company: "Moody's",
+    period: "Aug 2023 – Present",
+    bullets: [
+      "Contributed to the architecture and deployment of production-grade AI agents for enterprise compliance workflows (KYC, screening), contributing to multi-million-dollar annual revenue for Moody’s Platform.",
+      "Built and optimized RAG pipelines for enterprise knowledge and research use cases, improving retrieval quality and answer relevance and reducing manual research time by approximately 53% for downstream users.",
+      "Developed end-to-end evaluation and iteration pipelines for data-driven agent optimization, achieving up to 37% improvement in key quality metrics such as faithfulness and tool-call correctness.",
+      "Integrated MCP and Agent Skills with Moody’s services, reducing integration overhead for GenAI use cases and supporting broader product adoption.",
+      "Served as core backend engineer for Moody’s Copilot: backend microservices, CI/CD pipelines, and external service integrations for 14,000+ global employees, improving internal productivity.",
+    ],
   },
   {
     role: "Software Engineer",
-    company: "Previous Company",
-    period: "2022 - 2024",
-    description:
-      "Developed full-stack applications with Python and TypeScript. Built data pipelines and machine learning systems.",
+    company: "Bank of China USA",
+    period: "Jan 2023 – Aug 2023",
+    bullets: [
+      "Built an NLP (BERT, LLM) and OCR system for suspicious entity identification, deployed across the LCD Department.",
+      "Developed an internal KYC web platform (Flask, SQL Server, Bootstrap) from scratch, improving team efficiency.",
+      "Designed ETL pipelines and Qlik Sense dashboards, automating reporting for stakeholders.",
+    ],
   },
   {
-    role: "Research Associate",
-    company: "Columbia University",
-    period: "2020 - 2022",
-    description:
-      "NLP research including semi-supervised learning for part-of-speech tagging. Collaborated with J.P. Morgan on applied ML projects.",
+    role: "Data Scientist Intern",
+    company: "Moody's Rating",
+    period: "June 2022 – Nov 2022",
+    bullets: [
+      "Developed a LightGBM rating model with SHAP and InterpretML, improving explainability for analysts.",
+      "Built Dash/React dashboards and an internal Python package to streamline analyst workflows.",
+      "Engineered end-to-end ML pipelines (AWS S3, SageMaker, Docker) and deployed multiple models to production.",
+    ],
+  },
+  {
+    role: "Machine Learning Engineer",
+    company: "Winner Technology",
+    period: "Dec 2019 – July 2021",
+    bullets: [
+      "Built and deployed deep learning models (PyTorch) on AWS EC2 for mall passenger flow analysis, adopted by 100+ malls (e.g. Powerlong, Longfor).",
+      "Developed an ad recommendation system and ran A/B tests, achieving +10% CTR and higher purchases.",
+      "Engineered large-scale data pipelines (1,000+ malls, 20,000+ brands) and interpretable models to measure promotional impact, increasing ROI by 23%.",
+    ],
   },
 ];
 

@@ -42,12 +42,19 @@ ${ABOUT_TEXT}
 `;
 }
 
+function formatExperienceBody(exp: (typeof EXPERIENCE)[number]): string {
+  if (exp.bullets?.length) {
+    return exp.bullets.map((b) => `  • ${b}`).join("\n");
+  }
+  return `  ${exp.description ?? ""}`;
+}
+
 function formatExperience(): string {
   const lines = EXPERIENCE.map(
     (exp) => `
   ${exp.role} @ ${exp.company}
   ${exp.period}
-  ${exp.description}
+${formatExperienceBody(exp)}
 `
   );
   return `
