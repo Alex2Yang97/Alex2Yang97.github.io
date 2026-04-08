@@ -1,0 +1,597 @@
+---
+title: "Learning Notes: Deep Agents Middleware System"
+date: "2026-04-07"
+excerpt: "How the middleware onion pattern gives Deep Agents its core capabilities — file tools, subagents, summarization, and more."
+tags: ["learning-notes", "langchain", "deep-agents", "ai-agents", "middleware"]
+---
+
+These are my learning notes from reading the Deep Agents SDK source code (by LangChain). This post covers the middleware system — the central design pattern that gives Deep Agents its core capabilities.
+
+## What is middleware?
+
+Middleware is a **chain of interceptors** between the agent runtime and the LLM. Every LLM call passes through a stack of `wrap_model_call()` hooks, and every tool execution passes through a stack of `wrap_tool_call()` hooks. Middleware can modify system prompts, filter tools, transform messages, update state, and provide tools — none of which a plain tool can do.
+
+The key insight: a plain tool is *reactive* (called **by** the LLM), but middleware is *proactive* (runs **before/after** every LLM call and tool call).
+
+## Why middleware instead of plain tools?
+
+| Capability | Plain tool | Middleware |
+|------------|-----------|-----------|
+| Filter tools dynamically | No | Yes — `FilesystemMiddleware` removes `execute` when the backend doesn't support it |
+| Inject system-prompt context | No | Yes — `MemoryMiddleware`, `SkillsMiddleware` inject instructions on every call |
+| Transform messages | No | Yes — `SummarizationMiddleware` truncates args, summarizes history |
+| Maintain cross-turn state | No | Yes — `SummarizationMiddleware` tracks events across turns |
+| Provide tools to the LLM | No (a tool can't register other tools) | Yes — `middleware.tools` is collected by `create_agent()` |
+
+**Decision rule:** Use middleware when the tool needs to modify the prompt/tool list per-call, track state across turns, or be available to all SDK consumers. Use a plain tool when the function is stateless, self-contained, and specific to a single consumer.
+
+## The `AgentMiddleware` base class
+
+### Type parameters
+
+```python
+class AgentMiddleware(Generic[StateT, ContextT, ResponseT]):
+    state_schema: type[StateT]    # merged into the graph's state schema
+    tools: Sequence[BaseTool]     # collected by create_agent() into ToolNode
+```
+
+- `StateT` — the state schema this middleware contributes (e.g., `FilesystemState` adds `files`).
+- `ContextT` — the runtime context type (usually `None`).
+- `ResponseT` — the structured response type (usually `Any`).
+
+### The 7 hooks
+
+| Hook | Timing | Signature | Return |
+|------|--------|-----------|--------|
+| `before_agent` | Once, at invocation start | `(state, runtime) → dict \| None` | State updates |
+| `before_model` | Before each LLM call | `(state, runtime) → dict \| None` | State updates |
+| `wrap_model_call` | **Wraps** each LLM call | `(request, handler) → ModelResponse \| ExtendedModelResponse` | Response + optional Command |
+| `after_model` | After each LLM call | `(state, runtime) → dict \| None` | State updates |
+| `wrap_tool_call` | **Wraps** each tool execution | `(request, handler) → ToolMessage \| Command` | Tool result |
+| `after_agent` | Once, at invocation end | `(state, runtime) → dict \| None` | State updates |
+
+Each has a sync + async variant (e.g., `wrap_model_call` / `awrap_model_call`).
+
+### Execution flow in one agent turn
+
+```
+User message arrives
+        │
+        ▼
+  before_agent()         ← once per invocation
+        │
+        ▼
+  ┌─────────────────────────── agent loop ───────────────────────────┐
+  │  before_model()                                                  │
+  │       │                                                          │
+  │       ▼                                                          │
+  │  wrap_model_call chain (outermost → innermost → LLM call)       │
+  │       │                                                          │
+  │       ▼                                                          │
+  │  after_model()                                                   │
+  │       │                                                          │
+  │       ▼                                                          │
+  │  if AIMessage has tool_calls:                                    │
+  │    wrap_tool_call chain (outermost → innermost → tool execution) │
+  │    └─ loop back to before_model()                                │
+  │  else:                                                           │
+  │    └─ exit loop                                                  │
+  └──────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+  after_agent()          ← once per invocation
+```
+
+### Two categories of hooks
+
+| Category | Hooks | Execution mechanism | Mental model |
+|----------|-------|--------------------|-|
+| **State hooks** | `before_agent`, `before_model`, `after_model`, `after_agent` | Each becomes a **separate LangGraph node** | Sequential pipeline — one runs, returns state updates, next runs |
+| **Wrapper hooks** | `wrap_model_call`, `wrap_tool_call` | Composed into a **single nested function** via the onion pattern | Russian nesting dolls — outer wraps inner wraps actual call |
+
+State hooks are simple and declarative: receive state, return dict updates. Wrapper hooks give full control: modify request before, modify response after, retry, cache, short-circuit.
+
+### How LangChain detects which hooks a middleware implements
+
+`create_agent()` uses **method identity comparison** against the base class:
+
+```python
+middleware_w_before_agent = [
+    m
+    for m in middleware
+    if m.__class__.before_agent is not AgentMiddleware.before_agent
+    or m.__class__.abefore_agent is not AgentMiddleware.abefore_agent
+]
+```
+
+If the subclass did NOT override a hook, it's the same Python object as the base class method — so the middleware is skipped for that hook. This avoids creating unnecessary graph nodes.
+
+### State hooks become LangGraph nodes
+
+For each middleware that overrides a state hook, `create_agent()` creates a dedicated graph node:
+
+```python
+for m in middleware:
+    if (
+        m.__class__.before_agent is not AgentMiddleware.before_agent
+        or m.__class__.abefore_agent is not AgentMiddleware.abefore_agent
+    ):
+        before_agent_node = RunnableCallable(sync_before_agent, async_before_agent, trace=False)
+        graph.add_node(
+            f"{m.name}.before_agent", before_agent_node, input_schema=resolved_state_schema
+        )
+```
+
+Resulting graph topology:
+
+```
+START → MW1.before_agent → MW2.before_agent → MW1.before_model → ... → model → ... → END
+                                                     ▲                           │
+                                                     └──────── tools ◄───────────┘
+```
+
+After tools execute, the loop goes back to the first `before_model`, NOT `before_agent`. The `before_agent` / `after_agent` nodes are **outside** the loop.
+
+### Wrapper hooks use onion composition
+
+`wrap_model_call` hooks are NOT separate graph nodes. They're composed into a **single function** inside the `model_node`:
+
+```python
+def compose_two(outer, inner):
+    def composed(request, handler):
+        accumulated_commands = []
+
+        def inner_handler(req):
+            accumulated_commands.clear()
+            inner_result = inner(req, handler)
+            return inner_result.model_response
+
+        outer_result = outer(request, inner_handler)
+        return _to_composed_result(outer_result, extra_commands=accumulated_commands)
+
+    return composed
+
+# Compose right-to-left: outer(inner(innermost(handler)))
+composed_handler = compose_two(handlers[-2], handlers[-1])
+for h in reversed(handlers[:-2]):
+    composed_handler = compose_two(h, composed_handler)
+```
+
+When you call `handler(request)` inside your `wrap_model_call`, you're calling the **next middleware's** `wrap_model_call` — NOT the LLM. Only the innermost middleware's `handler()` triggers the actual LLM call.
+
+With three middleware `[A, B, C]`:
+
+```
+A.wrap_model_call(request, handler_for_A)
+  → A modifies request
+  → A calls handler_for_A(new_request)
+    → B.wrap_model_call(new_request, handler_for_B)
+      → B modifies request
+      → B calls handler_for_B(newer_request)
+        → C.wrap_model_call(newer_request, handler_for_C)
+          → C calls handler_for_C(final_request)
+            → ACTUAL LLM CALL  ← only here
+          ← C sees response, can modify it
+        ← B sees response, can modify it
+      ← A sees response, can modify it
+```
+
+The composed handler is called inside `model_node`:
+
+```python
+async def amodel_node(state, runtime):
+    request = ModelRequest(model=model, tools=default_tools, messages=state["messages"], ...)
+
+    if awrap_model_call_handler is None:
+        model_response = await _execute_model_async(request)
+        return _build_commands(model_response)
+
+    result = await awrap_model_call_handler(request, _execute_model_async)
+    return _build_commands(result.model_response, result.commands)
+```
+
+`wrap_tool_call` follows the same onion pattern but is passed to `ToolNode` directly:
+
+```python
+tool_node = ToolNode(
+    tools=available_tools,
+    wrap_tool_call=wrap_tool_call_wrapper,
+    awrap_tool_call=awrap_tool_call_wrapper,
+)
+```
+
+### Why this two-tier design?
+
+| Design choice | Benefit |
+|--------------|---------|
+| State hooks as graph nodes | Visible in LangGraph traces, can return `Command` with `goto` for control flow |
+| Wrapper hooks as composed functions | Full request/response control — can retry, short-circuit, cache, or transform |
+| Method identity detection | Zero overhead for hooks a middleware doesn't use |
+
+## `wrap_model_call` — the most important hook
+
+### The handler pattern
+
+```python
+def wrap_model_call(
+    self,
+    request: ModelRequest[ContextT],
+    handler: Callable[[ModelRequest[ContextT]], ModelResponse[ResponseT]],
+) -> ModelResponse[ResponseT] | ExtendedModelResponse:
+```
+
+The `handler` callback executes the next middleware in the chain (or the actual LLM call if this is the innermost):
+
+```
+FilesystemMW.wrap_model_call(request, handler)
+  │  modifies request (adds system prompt, filters tools)
+  └─ handler(request)
+     │
+     SubAgentMW.wrap_model_call(request, handler)
+       │  modifies request (adds task tool instructions)
+       └─ handler(request)
+          │
+          SummarizationMW.wrap_model_call(request, handler)
+            │  modifies request (truncates args, summarizes if needed)
+            └─ handler(request)  ← ACTUAL LLM CALL
+```
+
+First middleware in the list = outermost wrapper.
+
+### `ModelRequest`
+
+```python
+@dataclass
+class ModelRequest(Generic[ContextT]):
+    model: BaseChatModel
+    messages: list[AnyMessage]
+    system_message: SystemMessage | None
+    tools: list[BaseTool | dict[str, Any]]
+    tool_choice: Any | None
+    response_format: ResponseFormat | None
+    state: AgentState[Any]
+    runtime: Runtime[ContextT]
+    model_settings: dict[str, Any]
+```
+
+Middleware modifies via `request.override(...)` — an immutable pattern that returns a new instance:
+
+```python
+new_request = request.override(
+    system_message=append_to_system_message(request.system_message, my_prompt),
+    tools=filtered_tools,
+    messages=truncated_messages,
+)
+return handler(new_request)
+```
+
+### `ModelResponse` vs `ExtendedModelResponse`
+
+- **`ModelResponse`** — the LLM's output: `result: list[BaseMessage]` + optional `structured_response`.
+- **`ExtendedModelResponse`** — wraps `ModelResponse` + a `Command` for state updates. Used when middleware needs to persist data alongside the LLM response.
+
+```python
+return ExtendedModelResponse(
+    model_response=response,
+    command=Command(update={"_summarization_event": new_event}),
+)
+```
+
+Commands are applied via the graph's reducers after the model node completes.
+
+## `wrap_tool_call` — intercepting tool execution
+
+```python
+def wrap_tool_call(
+    self,
+    request: ToolCallRequest,
+    handler: Callable[[ToolCallRequest], ToolMessage | Command],
+) -> ToolMessage | Command:
+```
+
+The `request` contains:
+
+- `request.tool_call` — the tool call dict `{"name": "read_file", "args": {...}, "id": "..."}`
+- `request.tool` — the `BaseTool` instance
+- `request.state` — current agent state
+- `request.runtime` — `ToolRuntime` with state, context, store, config, `tool_call_id`
+
+Only `FilesystemMiddleware` uses this hook in the SDK — to evict large tool results.
+
+## The middleware stack in `create_deep_agent()`
+
+```python
+deepagent_middleware = [
+    TodoListMiddleware(),
+    SkillsMiddleware(backend=backend, sources=skills),     # optional
+    FilesystemMiddleware(backend=backend),
+    SubAgentMiddleware(backend=backend, subagents=[...]),
+    create_summarization_middleware(model, backend),
+    PatchToolCallsMiddleware(),
+    # --- user middleware inserted here ---
+    AnthropicPromptCachingMiddleware(...),
+    MemoryMiddleware(backend=backend, sources=memory),      # optional
+    HumanInTheLoopMiddleware(interrupt_on=interrupt_on),    # optional
+]
+```
+
+Memory and caching are last (closest to the LLM) so that memory updates don't invalidate the Anthropic prompt cache prefix. The filesystem middleware is early because most other middleware depend on its tools.
+
+## `FilesystemMiddleware`
+
+The largest (~1637 lines) and most important middleware. Provides all file tools and handles context management via eviction.
+
+### State contribution
+
+```python
+class FilesystemState(AgentState):
+    files: Annotated[NotRequired[dict[str, FileData]], _file_data_reducer]
+```
+
+The `_file_data_reducer` merges file dicts with `None`-based deletion:
+
+```python
+existing = {"/a.txt": FileData(...), "/b.txt": FileData(...)}
+update   = {"/b.txt": None, "/c.txt": FileData(...)}
+result   = {"/a.txt": FileData(...), "/c.txt": FileData(...)}  # /b.txt deleted
+```
+
+### Tools
+
+| Tool | Schema | Backend method | Excluded from eviction? |
+|------|--------|----------------|------------------------|
+| `ls` | `LsSchema` | `backend.ls()` | Yes |
+| `read_file` | `ReadFileSchema` | `backend.read()` | Yes |
+| `write_file` | `WriteFileSchema` | `backend.write()` | Yes |
+| `edit_file` | `EditFileSchema` | `backend.edit()` | Yes |
+| `glob` | `GlobSchema` | `backend.glob()` | Yes |
+| `grep` | `GrepSchema` | `backend.grep()` | Yes |
+| `execute` | `ExecuteSchema` | `backend.execute()` | **No** |
+
+All tools follow the same pattern:
+
+1. Get custom description or use default
+2. Define sync function: resolve backend → validate path → call backend method → format result
+3. Define async function with same logic using `a`-prefixed methods
+4. Return `StructuredTool.from_function()` with both sync/async and Pydantic schema
+
+### `wrap_model_call()` — three actions on every LLM call
+
+1. **Dynamic tool filtering** — checks `_supports_execution(backend)`. If the backend isn't a `SandboxBackendProtocol`, the `execute` tool is removed from `request.tools`.
+2. **System prompt injection** — appends `FILESYSTEM_SYSTEM_PROMPT` (and `EXECUTION_SYSTEM_PROMPT` if execute is available) to the system message.
+3. **HumanMessage eviction** — if the most recent `HumanMessage` exceeds `human_message_token_limit_before_evict` (default 50k tokens), its content is written to `/conversation_history/{uuid}.md` and replaced with a truncated preview.
+
+### `wrap_tool_call()` — large result eviction
+
+After every tool call (except excluded tools), checks if the result exceeds `tool_token_limit_before_evict` (default 20k tokens, ~80k chars). If so:
+
+1. Writes full content to `/large_tool_results/{sanitized_tool_call_id}`
+2. Replaces the `ToolMessage` content with a head+tail preview and file path reference
+3. The LLM can then use `read_file` to paginate through the full result
+
+Why certain tools are excluded:
+
+- `ls`, `glob`, `grep` — they truncate their own output; eviction would hide the "narrow your search" signal
+- `read_file` — eviction would cause the agent to re-read via `read_file`, creating a loop
+- `edit_file`, `write_file` — they return tiny confirmation messages, never need eviction
+
+Only `execute` and custom tools get evicted.
+
+### Constructor parameters
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `backend` | `StateBackend()` | The storage/execution backend |
+| `system_prompt` | `None` (auto) | Override the dynamic system prompt |
+| `custom_tool_descriptions` | `None` | Override individual tool descriptions by name |
+| `tool_token_limit_before_evict` | `20000` | Token threshold for tool result eviction |
+| `human_message_token_limit_before_evict` | `50000` | Token threshold for HumanMessage eviction |
+| `max_execute_timeout` | `3600` | Maximum seconds for per-command timeout overrides |
+
+## `SubAgentMiddleware`
+
+Implements the coordinator-worker pattern: the main agent spawns ephemeral subagents via a `task` tool.
+
+### The `SubAgent` spec
+
+```python
+class SubAgent(TypedDict):
+    name: str                  # unique identifier
+    description: str           # what it does — used by LLM to decide when to delegate
+    system_prompt: str         # instructions for the subagent
+    tools: NotRequired[...]    # tools available to the subagent
+    model: NotRequired[...]    # override the parent's model
+    middleware: NotRequired[..] # additional middleware
+    interrupt_on: NotRequired[..] # human-in-the-loop config
+    skills: NotRequired[...]   # skill source paths
+```
+
+### The `CompiledSubAgent` spec
+
+For bringing your own pre-built LangGraph agent:
+
+```python
+class CompiledSubAgent(TypedDict):
+    name: str
+    description: str
+    runnable: Runnable  # must have "messages" in its state schema
+```
+
+### State isolation
+
+When a subagent is spawned, `_validate_and_prepare_state()` creates filtered state:
+
+```python
+_EXCLUDED_STATE_KEYS = {
+    "messages", "todos", "structured_response", "skills_metadata", "memory_contents",
+}
+
+subagent_state = {k: v for k, v in runtime.state.items() if k not in _EXCLUDED_STATE_KEYS}
+subagent_state["messages"] = [HumanMessage(content=description)]  # fresh history
+```
+
+| What | Shared? | Why |
+|------|---------|-----|
+| `messages` | No — gets fresh `[HumanMessage(task)]` | Isolated context window |
+| `files` | Yes — passed through | Parent and child read/write same files |
+| `todos` | No — excluded | Parent-specific |
+| `skills_metadata` | No — excluded | Subagent loads its own |
+| `memory_contents` | No — excluded | Subagent loads its own |
+
+### Result flow
+
+When the subagent finishes:
+
+1. Only the **last message** in the subagent's history is extracted
+2. It's wrapped as a `ToolMessage` and returned to the parent
+3. Non-excluded state updates (e.g., `files`) are propagated back via `Command(update={...})`
+4. The parent never sees intermediate reasoning — only the final answer
+
+### The `task` tool
+
+Its description is auto-generated from the subagent specs:
+
+```
+Available agent types and the tools they have access to:
+- general-purpose: General-purpose agent for researching...
+- researcher: Research agent that searches the web...
+```
+
+The tool validates `subagent_type`, prepares state, invokes the subagent graph, and returns the result as a `Command`.
+
+### `wrap_model_call()`
+
+Injects `TASK_SYSTEM_PROMPT` into the system message. This teaches the LLM when and how to use the task tool (parallel execution, context isolation benefits, when NOT to use it).
+
+## `SummarizationMiddleware`
+
+Context management with a two-tier system. Prevents the conversation from exceeding the model's context window.
+
+### Two tiers
+
+| Tier | Trigger | Cost | What happens |
+|------|---------|------|-------------|
+| 1: Arg truncation | Lower threshold | Free — string ops only | Clips `args` on old `write_file`/`edit_file` tool calls to 20 chars + `"...(argument truncated)"` |
+| 2: Full summarization | 85% of context | 1 LLM call | Offloads old messages to backend, replaces with summary |
+
+### State contribution
+
+```python
+class SummarizationState(AgentState):
+    _summarization_event: Annotated[NotRequired[SummarizationEvent | None], PrivateStateAttr]
+```
+
+```python
+class SummarizationEvent(TypedDict):
+    cutoff_index: int              # messages[0:cutoff] were summarized
+    summary_message: HumanMessage  # the summary (tagged with lc_source="summarization")
+    file_path: str | None          # where history was offloaded
+```
+
+### Model-aware defaults
+
+`compute_summarization_defaults()` adapts to the model:
+
+| Model has profile? | Trigger | Keep | Arg truncation |
+|-------------------|---------|------|----------------|
+| Yes (`max_input_tokens` known) | 85% of context | 10% of context | 85% / 10% fraction |
+| No | 170k tokens fixed | 6 messages fixed | 20 messages / 20 messages |
+
+### `ContextSize` — the threshold type
+
+A tuple `(mode, value)` supporting three modes:
+
+| Mode | Example | Meaning |
+|------|---------|---------|
+| `"tokens"` | `("tokens", 170000)` | Fire when total tokens >= 170k |
+| `"messages"` | `("messages", 50)` | Fire when message count >= 50 |
+| `"fraction"` | `("fraction", 0.85)` | Fire when tokens >= 85% of `max_input_tokens` |
+
+### The `wrap_model_call()` flow
+
+1. **Reconstruct** effective messages from prior `_summarization_event` (if one exists: `[summary_msg] + messages[cutoff_index:]`)
+2. **Truncate tool args** in old messages (Tier 1) — only `write_file`/`edit_file` args before the keep window, clipped to 20 chars
+3. **Check token threshold**:
+   - Below threshold → call `handler(request)` with truncated messages
+   - Above threshold (or `ContextOverflowError`) → full summarization (Tier 2)
+4. **Full summarization** (Tier 2):
+   - Determine cutoff index
+   - Partition: `[to_summarize | preserved]`
+   - Offload `to_summarize` to `/conversation_history/{thread_id}.md`
+   - Generate summary via LLM
+   - Build `[summary_msg | preserved]`, call handler
+   - Return `ExtendedModelResponse` with `_summarization_event` update
+
+In the async path, offloading and summary generation run **concurrently** via `asyncio.gather()`.
+
+### History offloading
+
+`_offload_to_backend()` appends a timestamped section to a single markdown file per thread at `/conversation_history/{thread_id}.md`. Previous summary messages are filtered out to avoid redundant storage. The agent can `read_file` this path to recover old details.
+
+### The `compact_conversation` tool
+
+`SummarizationToolMiddleware` provides a manual compaction tool. It reuses the `SummarizationMiddleware` engine.
+
+Compaction is only allowed when reported usage reaches ~50% of the auto-trigger threshold. This prevents premature compaction.
+
+### `TruncateArgsSettings`
+
+```python
+class TruncateArgsSettings(TypedDict, total=False):
+    trigger: ContextSize | None    # when to activate
+    keep: ContextSize              # how many recent messages to leave untouched
+    max_length: int                # char limit per arg (default 2000)
+    truncation_text: str           # replacement suffix (default "...(argument truncated)")
+```
+
+Only `write_file` and `edit_file` tool call args are truncated.
+
+## How middleware, backend, agent, and tools connect
+
+| From → To | Interface | How |
+|-----------|-----------|-----|
+| `create_agent()` → Middleware | Introspects hooks | Checks method identity against base class |
+| `create_agent()` → Middleware | Collects `m.tools` | Merged into `ToolNode` alongside user tools |
+| `create_agent()` → Middleware | Collects `m.state_schema` | Merged into a single TypedDict for the graph |
+| Middleware → LLM | `handler(request)` | Calls next middleware or actual LLM |
+| Middleware → Backend | `self.backend.read()`, etc. | Direct method calls |
+| Middleware → State | `ExtendedModelResponse(command=...)` | State updates via Commands |
+| Tool → Backend | Closure over `self.backend` | Middleware creates closures capturing backend |
+| Tool → State | `return Command(update={...})` | Applied by reducers |
+| Agent → Tools | `ToolNode` | Passes `ToolRuntime` |
+
+### The `ToolRuntime` bridge
+
+```python
+class ToolRuntime(Generic[ContextT, StateT]):
+    state: StateT              # current agent state
+    context: ContextT          # user-provided context
+    stream_writer: ...         # for streaming custom events
+    store: BaseStore | None    # persistent key-value store
+    config: RunnableConfig     # langgraph config (thread_id, etc.)
+    tool_call_id: str | None   # ID of the current tool call
+```
+
+Tools don't know about backends directly. The middleware creates closures that capture the backend reference:
+
+```python
+def sync_read_file(file_path, runtime, offset, limit):
+    resolved_backend = self._get_backend(runtime)
+    result = resolved_backend.read(validated_path)
+    return formatted_string
+```
+
+### The `append_to_system_message` helper
+
+The shared utility used by nearly every middleware:
+
+```python
+def append_to_system_message(system_message: SystemMessage | None, text: str) -> SystemMessage:
+    new_content = list(system_message.content_blocks) if system_message else []
+    if new_content:
+        text = f"\n\n{text}"
+    new_content.append({"type": "text", "text": text})
+    return SystemMessage(content_blocks=new_content)
+```
+
+Uses `content_blocks` instead of string concatenation to preserve structured content like images.

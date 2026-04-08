@@ -1,0 +1,243 @@
+---
+title: "Learning Notes: Deep Agents Backend System"
+date: "2026-04-07"
+excerpt: "The pluggable virtual filesystem that powers Deep Agents — from LangGraph state to real disk to remote sandboxes."
+tags: ["learning-notes", "langchain", "deep-agents", "ai-agents", "backend"]
+---
+
+These are my learning notes from reading the Deep Agents SDK source code (by LangChain). This post covers the backend system — the pluggable virtual filesystem that all middleware depends on.
+
+## What is a "backend"?
+
+A backend is a **virtual filesystem abstraction**. It gives every piece of the SDK — filesystem tools, summarization offload, memory loading, subagent file sharing — a uniform way to `read`, `write`, `edit`, `ls`, `grep`, and `glob` files, regardless of where those files actually live.
+
+The same code works whether files are stored in:
+
+- LangGraph agent state (ephemeral, per-thread)
+- A local disk (permanent)
+- A key-value store (persistent, cross-thread)
+- A remote container (Daytona, Modal, Runloop)
+- A mix of the above
+
+## Architecture overview
+
+```
+                    BackendProtocol (ABC)
+                    ┌─────────────────────────────┐
+                    │ ls · read · write · edit     │
+                    │ grep · glob                  │
+                    │ upload_files · download_files │
+                    └──────────────┬──────────────┘
+                                   │
+          ┌────────────┬───────────┼──────────┬────────────┐
+          │            │           │          │             │
+    StateBackend  Filesystem  StoreBackend  Composite   SandboxBackendProtocol
+    (LangGraph    Backend     (BaseStore)   Backend      ├── LocalShellBackend
+     state)       (disk)                    (router)     ├── LangSmithSandbox
+                                                         └── Partner sandboxes
+```
+
+- **`BackendProtocol`** — the ABC with 8 file operations (+ async variants).
+- **`SandboxBackendProtocol`** — extends `BackendProtocol` with `execute()` for shell commands.
+- **`CompositeBackend`** — routes different paths to different backends.
+
+## The protocol contract
+
+Every backend implements these 8 operations:
+
+| Method | Signature | Returns | Purpose |
+|--------|-----------|---------|---------|
+| `ls` | `(path: str)` | `LsResult` | List directory contents |
+| `read` | `(file_path, offset=0, limit=2000)` | `ReadResult` | Read file with pagination |
+| `write` | `(file_path, content)` | `WriteResult` | Create a **new** file (errors if exists) |
+| `edit` | `(file_path, old_string, new_string, replace_all=False)` | `EditResult` | Find-and-replace in existing file |
+| `grep` | `(pattern, path=None, glob=None)` | `GrepResult` | Literal text search |
+| `glob` | `(pattern, path="/")` | `GlobResult` | Find files by name pattern |
+| `upload_files` | `(files: list[tuple[str, bytes]])` | `list[FileUploadResponse]` | Batch upload |
+| `download_files` | `(paths: list[str])` | `list[FileDownloadResponse]` | Batch download |
+
+Every method has a sync and async version (e.g., `read` / `aread`). The default async impl delegates to `asyncio.to_thread(self.sync_method)`, so backend authors typically only implement sync.
+
+### Result types
+
+All result dataclasses follow a consistent pattern:
+
+- `error: str | None` — `None` on success, error message on failure
+- A data field — `None` on failure, populated on success
+
+```python
+@dataclass
+class ReadResult:
+    error: str | None = None
+    file_data: FileData | None = None
+```
+
+Callers always check `result.error` first.
+
+### The core data unit: `FileData`
+
+```python
+class FileData(TypedDict):
+    content: str                        # UTF-8 text or base64-encoded binary
+    encoding: str                       # "utf-8" or "base64"
+    created_at: NotRequired[str]        # ISO 8601
+    modified_at: NotRequired[str]       # ISO 8601
+```
+
+## `StateBackend` — the default
+
+`StateBackend` is what you get when you call `create_deep_agent()` without specifying a backend. Files live inside LangGraph's agent state.
+
+### How it accesses state
+
+It does **not** hold a `self._files` dict. Instead, it reads/writes on-demand through LangGraph's internal hooks:
+
+- `CONFIG_KEY_READ` — reads the `files` channel from the current graph context
+- `CONFIG_KEY_SEND` — queues a partial update to the `files` channel
+
+```python
+def _read_files(self) -> dict[str, Any]:
+    config = self._get_config()
+    read = config["configurable"][CONFIG_KEY_READ]
+    fresh = False  # snapshot from start of current superstep
+    return read("files", fresh) or {}
+
+def _send_files_update(self, update: dict[str, Any]) -> None:
+    config = self._get_config()
+    send = config["configurable"][CONFIG_KEY_SEND]
+    send([("files", update)])  # dict-merge reducer preserves unchanged files
+```
+
+Why not a plain dict? Two reasons:
+
+1. **Checkpoint restoration** — When a checkpointer restores a thread, the `files` channel is restored from the checkpoint. A `self._files` attribute would start empty.
+2. **Single instance, many steps** — The backend is created once in `create_deep_agent()` and reused across all steps. On-demand reads always get the latest state.
+
+### Write visibility: the step-boundary rule
+
+Writes are **queued**, not applied immediately. Within the same LangGraph step:
+
+```python
+backend.write("/foo.txt", "hello")   # Queues write
+backend.read("/foo.txt")             # Returns "file not found"
+```
+
+The write becomes visible in the **next** step after the reducer runs. This gives consistent, race-free reads within a step.
+
+### How `ls()` synthesizes directories
+
+State stores files as a flat dict: `{"/src/main.py": {...}, "/src/utils.py": {...}}`. The `ls()` method iterates all files, checks the path prefix, and separates:
+
+- **Immediate children** — files whose relative path has no `/`
+- **Subdirectories** — synthesized from the first path component of deeper files
+
+### v1 vs v2 file format
+
+| Format | `content` type | `encoding` field | Default since |
+|--------|---------------|------------------|---------------|
+| v1 (legacy) | `list[str]` (lines) | absent | < v0.5 |
+| v2 (current) | `str` | `"utf-8"` or `"base64"` | v0.5+ |
+
+**Read-tolerant, write-current:** `_normalize_content()` transparently joins `list[str]` to `str` on read. New writes always use v2. The `file_format="v1"` constructor arg exists for backward compatibility.
+
+## `FilesystemBackend` — real disk
+
+Maps the same protocol to actual filesystem operations. Key differences from `StateBackend`:
+
+| Aspect | `StateBackend` | `FilesystemBackend` |
+|--------|---------------|-------------------|
+| Persistence | Per-thread (checkpointed) | Permanent on disk |
+| Paths | Virtual (`/src/main.py`) | Real (`/Users/you/project/src/main.py`) |
+| Requires graph context | Yes | No |
+| Security | Isolated to state | Grants direct filesystem access |
+
+### `virtual_mode`
+
+When `virtual_mode=True`, the backend enforces path constraints — blocks `..`, `~`, and paths outside `root_dir`. Primarily used with `CompositeBackend` for virtual path semantics. Not a sandbox.
+
+## `CompositeBackend` — the path router
+
+Routes file operations to different backends based on path prefixes.
+
+```python
+composite = CompositeBackend(
+    default=StateBackend(),
+    routes={"/memories/": StoreBackend()}
+)
+
+composite.write("/temp.txt", "ephemeral")          # -> StateBackend
+composite.write("/memories/note.md", "persistent")  # -> StoreBackend
+```
+
+### Routing logic
+
+`_route_for_path()` does longest-prefix matching on `sorted_routes` (sorted by length, longest first):
+
+1. If path matches a route prefix exactly or starts with it, delegate to that backend with the prefix stripped.
+2. Otherwise, use the default backend.
+
+### Aggregate operations
+
+For root-level queries, `CompositeBackend` fans out to **all** backends:
+
+| Operation | `path="/"` behavior |
+|-----------|-------------------|
+| `ls("/")` | Merges default listing + virtual route directories |
+| `grep(pattern, "/")` | Searches all backends, remaps paths, merges results |
+| `glob(pattern)` | Searches all backends, strips/remaps route prefixes |
+| `execute(command)` | Always default backend (not path-routable) |
+
+### Why `execute()` is not routed
+
+Shell commands have no file path to route on. They run in an *execution environment* (container, VM, local shell), which is a property of the sandbox, not of individual file paths. Routes are for storage overlays, not alternative execution environments.
+
+## Utility functions
+
+Shared helpers in `backends/utils.py` that multiple backends depend on:
+
+| Function | Purpose |
+|----------|---------|
+| `validate_path(path)` | Security: blocks `..`, `~`, Windows paths, optional prefix allowlist |
+| `create_file_data(content)` | Creates `FileData` with timestamps |
+| `update_file_data(file_data, content)` | Updates content, preserves `created_at` |
+| `file_data_to_string(file_data)` | Normalizes v1 `list[str]` to v2 `str` |
+| `slice_read_response(file_data, offset, limit)` | Paginates content by line range |
+| `format_content_with_line_numbers(content)` | `cat -n` style line numbers for LLM consumption |
+| `perform_string_replacement(content, old, new)` | Find-and-replace with occurrence validation |
+| `grep_matches_from_files(files, pattern)` | Literal text search returning `GrepResult` |
+| `_glob_search_files(files, pattern, path)` | Glob matching using `wcmatch` library |
+| `truncate_if_too_long(result)` | Caps output at ~20K tokens |
+
+## The full backend catalog
+
+| Backend | Protocol | Storage | Persistence | Typical use case |
+|---------|----------|---------|-------------|-----------------|
+| `StateBackend` | `BackendProtocol` | LangGraph state | Per-thread | Default for API servers, headless agents |
+| `FilesystemBackend` | `BackendProtocol` | Local disk | Permanent | CLI, local dev (with HITL) |
+| `StoreBackend` | `BackendProtocol` | `BaseStore` | Cross-thread | Memories, persistent notes |
+| `CompositeBackend` | `BackendProtocol` | Routes to others | Depends | Hybrid: state + memories |
+| `LocalShellBackend` | `SandboxBackendProtocol` | Disk + shell | Permanent | CLI with command execution |
+| `LangSmithSandbox` | `SandboxBackendProtocol` | Remote container | Per-sandbox | Cloud deployments |
+| Daytona/Modal/Runloop | `SandboxBackendProtocol` | Remote container | Varies | Partner integrations |
+
+## How backends connect to the rest of the SDK
+
+In `create_deep_agent()`:
+
+```python
+backend = backend if backend is not None else StateBackend()
+
+gp_middleware = [
+    TodoListMiddleware(),
+    FilesystemMiddleware(backend=backend),
+    create_summarization_middleware(model, backend),
+    PatchToolCallsMiddleware(),
+]
+```
+
+The backend flows into:
+
+1. **`FilesystemMiddleware`** — creates the file tools the LLM calls (`ls`, `read`, `write`, `edit`, `grep`, `glob`, optionally `execute`)
+2. **`SummarizationMiddleware`** — offloads conversation history to backend when context gets large
+3. **`MemoryMiddleware`** — uses `download_files()` to load AGENTS.md on startup
+4. **`SubAgentMiddleware`** — subagents share the same backend, so parent and child can access the same files

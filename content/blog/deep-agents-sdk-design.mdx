@@ -1,0 +1,501 @@
+---
+title: "Learning Notes: Deep Agents SDK Design and Entry Point"
+date: "2026-04-07"
+excerpt: "How create_deep_agent() assembles a fully configured agent from model, middleware, backend, and subagent primitives."
+tags: ["learning-notes", "langchain", "deep-agents", "ai-agents", "sdk-design"]
+---
+
+These are my learning notes from reading the Deep Agents SDK source code (by LangChain). This first post covers the overall architecture and the `create_deep_agent()` entry point — the single function that assembles a fully configured agent.
+
+## What is Deep Agents?
+
+Deep Agents is **not** a standalone agent runtime. It is a **batteries-included configuration layer** on top of two LangChain primitives:
+
+- **`create_agent()`** — LangChain's standard agent factory that builds a LangGraph `StateGraph` with a model node, tools node, and agent loop.
+- **`AgentMiddleware`** — LangChain's interception framework that hooks into the model call lifecycle.
+
+The entire public API surface is a single function: `create_deep_agent()`. Everything else is internal machinery.
+
+## Package structure
+
+```
+deepagents/                          v0.5.1, Python >=3.11
+├── __init__.py                      Public API: create_deep_agent + middleware types
+├── graph.py                         THE entry point — assembles everything (428 lines)
+├── _models.py                       Model string → BaseChatModel resolution (149 lines)
+├── _version.py                      "0.5.1"
+├── backends/                        Virtual filesystem abstraction
+│   ├── protocol.py                  BackendProtocol ABC + SandboxBackendProtocol
+│   ├── state.py                     Default: LangGraph state-channel backend
+│   ├── filesystem.py                Real disk backend
+│   ├── composite.py                 Route paths → different backends
+│   ├── store.py                     LangGraph BaseStore backend
+│   ├── local_shell.py               Shell execution via subprocess
+│   ├── langsmith.py                 LangSmith sandbox execution
+│   └── sandbox.py                   Partner sandbox base
+└── middleware/                       8 middleware layers
+    ├── __init__.py                   Docstring: why middleware > plain tools
+    ├── filesystem.py                 File ops tools + eviction (~1637 lines)
+    ├── subagents.py                  Coordinator-worker pattern
+    ├── summarization.py              Context window management
+    ├── memory.py                     AGENTS.md loading + persistent learning
+    ├── skills.py                     SKILL.md progressive disclosure
+    ├── async_subagents.py            Remote/background subagents
+    ├── patch_tool_calls.py           LLM tool call repair
+    └── _utils.py                     Shared helpers
+```
+
+Three layers stacked like a pyramid:
+
+```
+            ┌───────────────────────────────┐
+            │      create_deep_agent()      │  ← Orchestrator (graph.py)
+            │ Single function, all config   │
+            └─────────────┬─────────────────┘
+                          │
+            ┌─────────────▼─────────────────┐
+            │     Middleware Stack           │  ← 8 layers providing capabilities
+            │ TodoList · Skills · Filesystem │
+            │ SubAgent · Summarization · ... │
+            └─────────────┬─────────────────┘
+                          │
+            ┌─────────────▼─────────────────┐
+            │     Backend System            │  ← Pluggable virtual filesystem
+            │ State · Filesystem · Store    │
+            │ Composite · Sandboxes         │
+            └───────────────────────────────┘
+```
+
+### Runtime dependencies
+
+| Package | Version | Role |
+|---------|---------|------|
+| `langchain-core` | `>=1.2.27` | Base abstractions (`BaseChatModel`, `BaseTool`, messages) |
+| `langchain` | `>=1.2.15` | `create_agent()`, `AgentMiddleware`, `AgentState` |
+| `langchain-anthropic` | `>=1.4.0` | Default model (`ChatAnthropic`) + prompt caching middleware |
+| `langchain-google-genai` | `>=4.2.1` | Google model support |
+| `langsmith` | `>=0.3.0` | Tracing, sandbox integration |
+| `wcmatch` | any | Glob pattern matching for file search |
+
+## The LangChain foundation
+
+Before understanding `create_deep_agent()`, you need to understand what it wraps.
+
+### `create_agent()` — the agent factory
+
+Defined in `langchain.agents.factory` (~970 lines). It builds a LangGraph `StateGraph` with:
+
+- A **model node** that invokes the LLM and handles structured output
+- A **tools node** (`ToolNode`) that executes tool calls from the LLM response
+- **Middleware nodes** — `before_agent`, `before_model`, `after_model`, `after_agent` lifecycle hooks
+- **Conditional edges** that route between model → tools → model (loop) or model → end
+
+```python
+def create_agent(
+    model: str | BaseChatModel,
+    tools: Sequence[BaseTool | Callable | dict] | None = None,
+    *,
+    system_prompt: str | SystemMessage | None = None,
+    middleware: Sequence[AgentMiddleware] = (),
+    response_format: ...,
+    state_schema: type[AgentState] | None = None,
+    context_schema: type[ContextT] | None = None,
+    checkpointer: Checkpointer | None = None,
+    store: BaseStore | None = None,
+    debug: bool = False,
+    name: str | None = None,
+    cache: BaseCache | None = None,
+) -> CompiledStateGraph
+```
+
+### `AgentState` — the state schema
+
+```python
+class AgentState(TypedDict, Generic[ResponseT]):
+    messages: Required[Annotated[list[AnyMessage], add_messages]]
+    jump_to: NotRequired[Annotated[JumpTo | None, EphemeralValue, PrivateStateAttr]]
+    structured_response: NotRequired[Annotated[ResponseT, OmitFromInput]]
+```
+
+Three fields:
+
+| Field | Reducer | Purpose |
+|-------|---------|---------|
+| `messages` | `add_messages` | Conversation history — appends, never replaces |
+| `jump_to` | Ephemeral | Routing directive (`"tools"`, `"model"`, or `"end"`), reset each step |
+| `structured_response` | None | Parsed structured output when `response_format` is used |
+
+### `AgentMiddleware` — the interception base class
+
+```python
+class AgentMiddleware(Generic[StateT, ContextT, ResponseT]):
+    state_schema: type[StateT]         # merged into graph state
+    tools: Sequence[BaseTool]          # collected into ToolNode
+```
+
+Five hooks, each with sync + async variant:
+
+| Hook | Timing | Pattern |
+|------|--------|---------|
+| `before_agent(state, runtime)` | Once at start | State hook → graph node |
+| `wrap_model_call(request, handler)` | Every LLM call | Onion wrapper → composed function |
+| `wrap_tool_call(request, handler)` | Every tool call | Onion wrapper → composed function |
+| `before_model` / `after_model` | Every LLM call | State hooks → graph nodes |
+| `after_agent(state, runtime)` | Once at end | State hook → graph node |
+
+The two wrapper hooks (`wrap_model_call`, `wrap_tool_call`) are the power hooks. They form an onion chain: calling `handler(request)` invokes the **next middleware**, not the LLM directly. Only the innermost middleware's `handler()` triggers the actual LLM/tool call.
+
+### `ModelRequest` — what middleware sees
+
+```python
+@dataclass
+class ModelRequest(Generic[ContextT]):
+    model: BaseChatModel
+    messages: list[AnyMessage]
+    system_message: SystemMessage | None
+    tools: list[BaseTool | dict]
+    tool_choice: Any | None
+    response_format: ResponseFormat | None
+    state: AgentState[Any]
+    runtime: Runtime[ContextT]
+    model_settings: dict[str, Any]
+```
+
+Middleware modifies via `request.override(...)` — an immutable pattern that returns a new instance:
+
+```python
+new_request = request.override(
+    system_message=append_to_system_message(request.system_message, my_prompt),
+    tools=filtered_tools,
+)
+return handler(new_request)
+```
+
+## `create_deep_agent()` — the 7-step assembly
+
+This is the entry point. Defined in `graph.py` (428 lines).
+
+### Function signature
+
+```python
+def create_deep_agent(
+    model: str | BaseChatModel | None = None,
+    tools: Sequence[BaseTool | Callable | dict] | None = None,
+    *,
+    system_prompt: str | SystemMessage | None = None,
+    middleware: Sequence[AgentMiddleware] = (),
+    subagents: Sequence[SubAgent | CompiledSubAgent | AsyncSubAgent] | None = None,
+    skills: list[str] | None = None,
+    memory: list[str] | None = None,
+    response_format: ... = None,
+    context_schema: type[ContextT] | None = None,
+    checkpointer: Checkpointer | None = None,
+    store: BaseStore | None = None,
+    backend: BackendProtocol | BackendFactory | None = None,
+    interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
+    debug: bool = False,
+    name: str | None = None,
+    cache: BaseCache | None = None,
+) -> CompiledStateGraph
+```
+
+Key design choices:
+
+| Parameter | Why it matters |
+|-----------|---------------|
+| `model: str \| BaseChatModel \| None` | Triple dispatch: `None` → default Sonnet, `str` → resolved via `init_chat_model`, instance → pass-through |
+| `tools` | **Additive** — merged with built-in middleware tools, not replacing them |
+| `middleware` | User middleware slots into a **specific position** in the stack (after core, before tail) |
+| `subagents` | Polymorphic: `SubAgent` (declarative), `CompiledSubAgent` (pre-built), or `AsyncSubAgent` (remote) |
+| `backend` | Single injection point for the virtual filesystem — everything flows through this |
+| `interrupt_on` | Human-in-the-loop gates: `{"edit_file": True}` pauses before edits |
+
+### Step 1 — Model resolution
+
+```python
+model = get_default_model() if model is None else resolve_model(model)
+backend = backend if backend is not None else StateBackend()
+```
+
+If `model` is `None` → `ChatAnthropic(model_name="claude-sonnet-4-6")`. If it's a string → dispatched through `resolve_model()`. If it's already a `BaseChatModel` → pass-through.
+
+Backend defaults to `StateBackend()` — files live in LangGraph agent state.
+
+Passing `model=None` without an `ANTHROPIC_API_KEY` in the environment will fail at invocation time. The error comes from the Anthropic client, not from Deep Agents.
+
+### Step 2 — General-purpose subagent spec
+
+```python
+gp_middleware: list[AgentMiddleware[Any, Any, Any]] = [
+    TodoListMiddleware(),
+    FilesystemMiddleware(backend=backend),
+    create_summarization_middleware(model, backend),
+    PatchToolCallsMiddleware(),
+]
+if skills is not None:
+    gp_middleware.append(SkillsMiddleware(backend=backend, sources=skills))
+gp_middleware.append(AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"))
+
+general_purpose_spec: SubAgent = {
+    **GENERAL_PURPOSE_SUBAGENT,
+    "model": model,
+    "tools": tools or [],
+    "middleware": gp_middleware,
+}
+if interrupt_on is not None:
+    general_purpose_spec["interrupt_on"] = interrupt_on
+```
+
+Every Deep Agent gets a default "general-purpose" subagent automatically. It inherits the same model, tools, skills, and `interrupt_on` as the parent. Its middleware stack is `[TodoList, Filesystem, Summarization, PatchToolCalls, optional Skills, PromptCaching]`.
+
+`SubAgentMiddleware` is **missing** from the subagent stack. Subagents cannot spawn sub-subagents by default — this prevents unbounded recursion.
+
+### Step 3 — Process user-defined subagents
+
+Three-way dispatch using duck typing on dict keys:
+
+```python
+for spec in subagents or []:
+    if "graph_id" in spec:        # AsyncSubAgent (remote)
+        async_subagents.append(cast("AsyncSubAgent", spec))
+    elif "runnable" in spec:      # CompiledSubAgent (pre-built, used as-is)
+        inline_subagents.append(spec)
+    else:                         # SubAgent (declarative, gets full stack built)
+        ...
+```
+
+For declarative `SubAgent` specs, the assembly logic:
+
+1. Resolves the model (inherits parent's if not specified)
+2. Builds a middleware stack: `[TodoList, Filesystem, Summarization, PatchToolCalls, optional Skills, user middleware, PromptCaching]`
+3. Inherits `interrupt_on` from parent unless overridden
+4. Inherits `tools` from parent unless overridden
+
+### Step 4 — Deduplicate general-purpose subagent
+
+```python
+if not any(spec["name"] == GENERAL_PURPOSE_SUBAGENT["name"] for spec in inline_subagents):
+    inline_subagents.insert(0, general_purpose_spec)
+```
+
+If the user already provided a subagent named `"general-purpose"`, the auto-generated one is skipped. This is the override mechanism — name a subagent `"general-purpose"` to replace the default.
+
+### Step 5 — Build main agent middleware stack
+
+```python
+deepagent_middleware = [
+    TodoListMiddleware(),
+    # SkillsMiddleware(...)                        (optional)
+    FilesystemMiddleware(backend=backend),
+    SubAgentMiddleware(backend=backend, subagents=[...]),
+    create_summarization_middleware(model, backend),
+    PatchToolCallsMiddleware(),
+    # AsyncSubAgentMiddleware(...)                  (optional)
+    # --- user middleware ---
+    AnthropicPromptCachingMiddleware(...),
+    # MemoryMiddleware(...)                         (optional)
+    # HumanInTheLoopMiddleware(...)                 (optional)
+]
+```
+
+The full stack in order:
+
+1. **TodoListMiddleware** — planning tools
+2. **SkillsMiddleware** — skill loading (optional)
+3. **FilesystemMiddleware** — file tools + eviction
+4. **SubAgentMiddleware** — task delegation
+5. **SummarizationMiddleware** — context management
+6. **PatchToolCallsMiddleware** — LLM error repair
+7. **AsyncSubAgentMiddleware** — remote subagents (optional)
+8. *(User middleware inserted here)*
+9. **AnthropicPromptCachingMiddleware** — cache markers
+10. **MemoryMiddleware** — AGENTS.md loading (optional)
+11. **HumanInTheLoopMiddleware** — approval gates (optional, always last)
+
+Why this order matters:
+
+| Decision | Reason |
+|----------|--------|
+| Memory **after** PromptCaching | Memory updates change the system prompt. Placing memory before caching would invalidate the Anthropic prompt cache prefix on every memory update. |
+| HITL **always last** | Human approval must be the final gate — nothing should bypass it. |
+| Summarization **after** Filesystem | Summarization needs to see filesystem tool outputs to decide what to truncate/evict. |
+| PatchToolCalls **after** Summarization | Repairs happen after all content transformations are done. |
+| Filesystem **before** SubAgent | File tool instructions must be in the system prompt before task tool instructions are added. |
+| PromptCaching safe for non-Anthropic | `unsupported_model_behavior="ignore"` makes it a no-op for OpenAI/Google models. |
+
+### Step 6 — Combine system prompts
+
+```python
+if system_prompt is None:
+    final_system_prompt = BASE_AGENT_PROMPT
+elif isinstance(system_prompt, SystemMessage):
+    final_system_prompt = SystemMessage(
+        content_blocks=[
+            *system_prompt.content_blocks,
+            {"type": "text", "text": f"\n\n{BASE_AGENT_PROMPT}"},
+        ]
+    )
+else:
+    final_system_prompt = system_prompt + "\n\n" + BASE_AGENT_PROMPT
+```
+
+`BASE_AGENT_PROMPT` is **always appended**. User prompts are prepended, so they have higher priority in the LLM's attention, but the base behaviors are always present.
+
+The string vs `SystemMessage` distinction matters: `SystemMessage` preserves structured `content_blocks` (list of dicts), allowing multimodal content like images alongside text. String concatenation would destroy non-text content.
+
+### Step 7 — Delegate to LangChain
+
+```python
+return create_agent(
+    model,
+    system_prompt=final_system_prompt,
+    tools=tools,
+    middleware=deepagent_middleware,
+    response_format=response_format,
+    context_schema=context_schema,
+    checkpointer=checkpointer,
+    store=store,
+    debug=debug,
+    name=name,
+    cache=cache,
+).with_config(
+    {
+        "recursion_limit": 9_999,
+        "metadata": {
+            "ls_integration": "deepagents",
+            "versions": {"deepagents": __version__},
+            "lc_agent_name": name,
+        },
+    }
+)
+```
+
+- `recursion_limit=9_999` — set extremely high because Deep Agents runs long-running tasks with many tool calls. LangGraph's default is 25.
+- `metadata` — enables LangSmith integration tracking.
+- `tools=tools` — these are the **user-provided** tools. Middleware tools are contributed via `m.tools` and collected separately by `create_agent()`.
+
+## `BASE_AGENT_PROMPT` — behavioral baseline
+
+Defined in `graph.py`. Every Deep Agent receives this prompt, appended after any custom `system_prompt`.
+
+| Section | Rule | Why |
+|---------|------|-----|
+| Core Behavior | "Don't say 'I'll now do X' — just do it" | Reduces token waste in agentic loops |
+| Core Behavior | "If the request is underspecified, ask only the minimum followup" | Prevents the agent from stalling |
+| Professional Objectivity | "Prioritize accuracy over validating the user's beliefs" | Avoids sycophantic behavior |
+| Doing Tasks | "Understand first → Act → Verify" | Three-phase execution pattern |
+| Doing Tasks | "Keep working until the task is fully complete" | Prevents premature yielding |
+| Doing Tasks | "If something fails repeatedly, stop and analyze" | Prevents infinite retry loops |
+| Clarifying Requests | "Do not ask for details the user already supplied" | Reduces redundant questions |
+| Progress Updates | "Provide brief progress updates at reasonable intervals" | UX for long-running tasks |
+
+## Model resolution — `_models.py`
+
+### `resolve_model()` — provider dispatch
+
+```python
+def resolve_model(model: str | BaseChatModel) -> BaseChatModel:
+    if isinstance(model, BaseChatModel):
+        return model
+    if model.startswith("openai:"):
+        return init_chat_model(model, use_responses_api=True)
+    if model.startswith("openrouter:"):
+        check_openrouter_version()
+        return init_chat_model(model, **_openrouter_attribution_kwargs())
+    return init_chat_model(model)
+```
+
+Four resolution paths:
+
+| Input | Behavior |
+|-------|----------|
+| `BaseChatModel` instance | Return unchanged |
+| `"openai:gpt-5"` | Forces OpenAI Responses API |
+| `"openrouter:..."` | Version check (`>=0.2.0`) + attribution headers |
+| `"anthropic:claude-..."` / `"google:gemini-..."` / etc. | Generic `init_chat_model()` dispatch |
+
+### OpenRouter attribution
+
+When no env vars are set, Deep Agents sends default attribution:
+
+```python
+_OPENROUTER_APP_URL = "https://github.com/langchain-ai/deepagents"
+_OPENROUTER_APP_TITLE = "Deep Agents"
+```
+
+If the user sets `OPENROUTER_APP_URL` or `OPENROUTER_APP_TITLE` env vars, those take precedence.
+
+### Helper functions
+
+- `get_model_identifier(model)` — extracts the provider-native identifier by serializing the model config and checking both `model_name` and `model` keys (providers disagree on the field name).
+- `model_matches_spec(model, spec)` — checks if a model instance already matches a string spec. Handles both exact match and prefix match. Used to avoid unnecessary re-initialization.
+
+## `get_default_model()`
+
+```python
+def get_default_model() -> ChatAnthropic:
+    return ChatAnthropic(model_name="claude-sonnet-4-6")
+```
+
+Requires `ANTHROPIC_API_KEY` in the environment. Returns a bare `ChatAnthropic` instance with no special configuration.
+
+## The public API surface
+
+From `__init__.py`:
+
+```python
+__all__ = [
+    "AsyncSubAgent",
+    "AsyncSubAgentMiddleware",
+    "CompiledSubAgent",
+    "FilesystemMiddleware",
+    "MemoryMiddleware",
+    "SubAgent",
+    "SubAgentMiddleware",
+    "__version__",
+    "create_deep_agent",
+]
+```
+
+9 exports total. `create_deep_agent` is the primary entry point. The middleware/subagent types are exported for consumers who need to customize beyond what the function parameters allow.
+
+## How tools reach the LLM
+
+Tools arrive through two paths that merge in `create_agent()`:
+
+```
+Path 1: User tools
+    create_deep_agent(tools=[my_tool, ...])
+        → create_agent(tools=[my_tool, ...])
+            → merged into ToolNode
+
+Path 2: Middleware tools
+    TodoListMiddleware().tools      → [write_todos]
+    FilesystemMiddleware().tools    → [ls, read_file, write_file, edit_file, glob, grep, execute]
+    SubAgentMiddleware().tools      → [task]
+    SummarizationMiddleware().tools → [compact_conversation]
+
+    create_agent(middleware=[...])
+        → for m in middleware: collect m.tools
+        → merged into ToolNode
+```
+
+The LLM sees the union of all tools. `FilesystemMiddleware.wrap_model_call()` may dynamically filter `execute` out if the backend doesn't support it.
+
+## Subagent middleware stack differences
+
+| Middleware | Main agent | General-purpose subagent | User subagent |
+|------------|-----------|------------------------|---------------|
+| TodoListMiddleware | Yes | Yes | Yes |
+| SkillsMiddleware | If `skills` provided | If `skills` provided | If subagent has `skills` |
+| FilesystemMiddleware | Yes | Yes | Yes |
+| **SubAgentMiddleware** | **Yes** | **No** | **No** |
+| SummarizationMiddleware | Yes | Yes | Yes |
+| PatchToolCallsMiddleware | Yes | Yes | Yes |
+| AsyncSubAgentMiddleware | If async subagents | No | No |
+| User middleware | After core stack | No | Subagent's own |
+| AnthropicPromptCachingMiddleware | Yes | Yes | Yes |
+| MemoryMiddleware | If `memory` provided | No | No |
+| HumanInTheLoopMiddleware | If `interrupt_on` | No (inherited via spec) | If `interrupt_on` set |
+
+The critical difference: subagents **do not** get `SubAgentMiddleware`. No sub-sub-agent spawning. This prevents unbounded task delegation chains.
